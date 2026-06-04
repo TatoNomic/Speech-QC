@@ -1,0 +1,168 @@
+Qualtrics.SurveyEngine.addOnReady(function () {
+
+  var _this = this;
+  var qid = this.questionId;
+
+  // ✅ DO NOT RESET q1_speech_sec HERE
+
+  // ----------------------------------------------------------
+  // ✅ UI (unchanged)
+  // ----------------------------------------------------------
+  var uiContainer = document.createElement("div");
+  uiContainer.style.margin = "20px auto";
+  uiContainer.style.padding = "24px";
+  uiContainer.style.borderRadius = "16px";
+  uiContainer.style.background = "#ffffff";
+  uiContainer.style.border = "1px solid #e2e8f0";
+  uiContainer.style.boxShadow = "0 10px 15px -3px rgba(0,0,0,0.1)";
+  uiContainer.style.maxWidth = "550px";
+  uiContainer.style.textAlign = "center";
+
+  var indicator = document.createElement("div");
+  indicator.style.display = "inline-block";
+  indicator.style.padding = "10px 20px";
+  indicator.style.borderRadius = "999px";
+  indicator.style.fontWeight = "600";
+  indicator.style.background = "#f8fafc";
+  indicator.innerText = "🎙️ Follow-up recording...";
+
+  var statsBoard = document.createElement("div");
+  statsBoard.style.background = "#1e293b";
+  statsBoard.style.color = "#10b981";
+  statsBoard.style.padding = "16px";
+  statsBoard.style.borderRadius = "8px";
+  statsBoard.style.fontFamily = "monospace";
+
+  uiContainer.appendChild(indicator);
+  uiContainer.appendChild(statsBoard);
+  document.getElementById(qid).appendChild(uiContainer);
+
+  // ----------------------------------------------------------
+  // ✅ PARAMETERS (same)
+  // ----------------------------------------------------------
+  var totalSpeechMs = 0;
+  var totalRecordingMs = 0;
+  var lastTimestamp = null;
+
+  var smoothedRMS = 0;
+  var lastSpeechTime = null;
+
+  var noiseDbfs = -60;
+  var speechDbfs = null;
+
+  var isRecording = false;
+  var loopStopped = false;
+
+  // ----------------------------------------------------------
+  // ✅ AUDIO
+  // ----------------------------------------------------------
+  navigator.mediaDevices.getUserMedia({
+    audio: {
+      autoGainControl: false,
+      echoCancellation: false,
+      noiseSuppression: false
+    }
+  }).then(function(stream) {
+
+    _this.micStream = stream;
+
+    var ctx = new (window.AudioContext || window.webkitAudioContext)();
+    var mic = ctx.createMediaStreamSource(stream);
+    var analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    mic.connect(analyser);
+
+    var buffer = new Uint8Array(analyser.fftSize);
+
+    function loop(timestamp) {
+
+      if (!_this.micStream || loopStopped) return;
+
+      if (!lastTimestamp) lastTimestamp = timestamp;
+      var delta = timestamp - lastTimestamp;
+      lastTimestamp = timestamp;
+
+      analyser.getByteTimeDomainData(buffer);
+
+      var sumSq = 0;
+      for (var i = 0; i < buffer.length; i++) {
+        var v = (buffer[i] - 128) / 128;
+        sumSq += v * v;
+      }
+
+      var rms = Math.sqrt(sumSq / buffer.length);
+      smoothedRMS = 0.8 * smoothedRMS + 0.2 * rms;
+
+      var currentDb = smoothedRMS > 1e-10
+        ? 20 * Math.log(smoothedRMS) / Math.LN10
+        : -100;
+
+      if (!isRecording && currentDb > noiseDbfs + 10) {
+        isRecording = true;
+        totalSpeechMs = 0;
+        totalRecordingMs = 0;
+        speechDbfs = null;
+      }
+
+      if (!isRecording) {
+        _this.animationId = requestAnimationFrame(loop);
+        return;
+      }
+
+      totalRecordingMs += delta;
+
+      var speaking = currentDb > noiseDbfs + 6;
+
+      if (speaking) {
+        totalSpeechMs += delta;
+        speechDbfs = speechDbfs === null
+          ? currentDb
+          : 0.9 * speechDbfs + 0.1 * currentDb;
+        lastSpeechTime = timestamp;
+      } else if (lastSpeechTime && (timestamp - lastSpeechTime < 600)) {
+        totalSpeechMs += delta;
+      }
+
+      var meanSNR = (speechDbfs !== null) ? (speechDbfs - noiseDbfs) : 0;
+
+      var voiced_pct = totalRecordingMs > 0
+        ? (totalSpeechMs / totalRecordingMs) * 100
+        : 0;
+
+      statsBoard.innerHTML =
+        "Speech: " + (totalSpeechMs/1000).toFixed(1) + "s<br>" +
+        "SNR: " + meanSNR.toFixed(1) + " dB<br>" +
+        "Voiced %: " + voiced_pct.toFixed(1) + "%";
+
+      _this.animationId = requestAnimationFrame(loop);
+    }
+
+    _this.animationId = requestAnimationFrame(loop);
+
+    // ----------------------------------------------------------
+    // ✅ SAVE METRICS (NEW PREFIX)
+    // ----------------------------------------------------------
+    function saveMetrics() {
+
+      var speechSec = totalSpeechMs / 1000;
+      var ratio = totalRecordingMs > 0 ? totalSpeechMs / totalRecordingMs : 0;
+      var meanSNR = (speechDbfs !== null) ? (speechDbfs - noiseDbfs) : 0;
+      var voiced_pct = totalRecordingMs > 0
+        ? (totalSpeechMs / totalRecordingMs) * 100
+        : 0;
+
+      Qualtrics.SurveyEngine.setEmbeddedData("q1f_speech_sec", Math.round(speechSec));
+      Qualtrics.SurveyEngine.setEmbeddedData("q1f_snr", meanSNR.toFixed(2));
+      Qualtrics.SurveyEngine.setEmbeddedData("q1f_speech_ratio", ratio.toFixed(3));
+      Qualtrics.SurveyEngine.setEmbeddedData("q1f_voiced_pct", voiced_pct.toFixed(1));
+    }
+
+    _this.saveMetrics = saveMetrics;
+
+  });
+
+});
+
+Qualtrics.SurveyEngine.addOnPageSubmit(function () {
+  if (this.saveMetrics) this.saveMetrics();
+});

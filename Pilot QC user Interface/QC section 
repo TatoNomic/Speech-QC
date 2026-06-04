@@ -1,0 +1,1295 @@
+/*
+ * glad-audio-qc-v2.js
+ * Browser-based audio quality verification for the GLAD-MHG study.
+ *
+ *
+ * Author:   Kavan Fatehi, SGDP Centre, King's College London
+ * Project:  GLAD
+ * Version:  0.2.1 (prototype + device/platform metadata + warm-up gating)
+ *
+ * WHAT IT DOES
+ *   Client-side, real-time estimation of background noise and SNR
+ *   for speech recordings collected via web browser or mobile app.
+ *   Designed to run as a pre-recording quality gate and as a
+ *   post-hoc check on completed clips.
+ *
+ *   v0.2 adds device and platform metadata capture (microphone
+ *   label/category, OS, browser, device class, and the actual
+ *   getSettings() values from the audio track) so device
+ *   characteristics can be used as covariates downstream.
+ *
+ * WHAT IT DOES NOT DO
+ *   Feature extraction, clinical decision-making, or PII handling.
+ *   All analysis is transient and in-memory; audio is only captured
+ *   when the host page explicitly calls record().
+ *
+ * METHOD
+ *   - getUserMedia with browser DSP disabled (raw signal).
+ *   - AudioWorklet framer: fixed frames with configurable hop.
+ *   - Per-frame: RMS (dBFS), peak, spectral flatness, clipping flag.
+ *   - Voice activity detection: energy threshold above running
+ *     noise floor AND spectral flatness below a ceiling.
+ *   - Noise floor: minimum statistics over a sliding window of
+ *     non-speech frames (Martin, 2001 style; 10th percentile).
+ *   - Speech level: exponential moving average of voiced frames.
+ *   - SNR = speech_dBFS - noise_dBFS.
+ *
+ * USAGE
+ *   const qc = new GladAudioQC({
+ *     onFrame: (m) => console.log(m.snr, m.noiseFloor),
+ *     onVerdict: (v) => console.log(v.level, v.reason),
+ *     thresholds: { snrGood: 20, snrWarn: 15 }
+ *   });
+ *   await qc.calibrate();        // 2s silence
+ *   qc.start();                  // live monitoring
+ *   const dev = await qc.getDeviceInfo();   // platform / mic / track settings
+ *   const clip = await qc.record(10000);    // records 10s, returns Blob + report
+ *   qc.stop();                   // releases mic
+ */
+
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory();
+  } else {
+    root.GladAudioQC = factory();
+  }
+}(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  const WORKLET_SRC = [
+    "class Framer extends AudioWorkletProcessor {",
+    "  constructor(opts) {",
+    "    super();",
+    "    const o = opts.processorOptions;",
+    "    this.frameSize = o.frameSize;",
+    "    this.hopSize = o.hopSize;",
+    "    this.buffer = new Float32Array(this.frameSize);",
+    "    this.filled = 0;",
+    "    this.captureRaw = false;",
+    "    this.port.onmessage = (e) => {",
+    "      if (e.data && e.data.type === 'captureRaw') this.captureRaw = !!e.data.on;",
+    "    };",
+    "  }",
+    "  process(inputs) {",
+    "    const input = inputs[0];",
+    "    if (!input || !input[0]) return true;",
+    "    const ch = input[0];",
+    "    // Forward raw block (non-overlapping) for PCM capture when enabled.",
+    "    if (this.captureRaw) {",
+    "      const raw = new Float32Array(ch.length);",
+    "      raw.set(ch);",
+    "      this.port.postMessage({ type: 'raw', data: raw });",
+    "    }",
+    "    // Frame buffer for analysis (overlapping).",
+    "    for (let i = 0; i < ch.length; i++) {",
+    "      this.buffer[this.filled++] = ch[i];",
+    "      if (this.filled >= this.frameSize) {",
+    "        this.port.postMessage({ type: 'frame', data: this.buffer.slice(0) });",
+    "        this.buffer.copyWithin(0, this.hopSize, this.frameSize);",
+    "        this.filled = this.frameSize - this.hopSize;",
+    "      }",
+    "    }",
+    "    return true;",
+    "  }",
+    "}",
+    "registerProcessor('glad-framer', Framer);"
+  ].join('\n');
+
+
+
+  // Frame RMS level in dBFS. 0 dBFS corresponds to a full-scale sine.
+  function rmsDbfs(frame) {
+    let sumSq = 0;
+    for (let i = 0; i < frame.length; i++) sumSq += frame[i] * frame[i];
+    const rms = Math.sqrt(sumSq / frame.length);
+    return rms > 1e-10 ? 20 * Math.log10(rms) : -100;
+  }
+
+  // Frame peak level in dBFS.
+  function peakDbfs(frame) {
+    let p = 0;
+    for (let i = 0; i < frame.length; i++) {
+      const a = Math.abs(frame[i]);
+      if (a > p) p = a;
+    }
+    return p > 1e-10 ? 20 * Math.log10(p) : -100;
+  }
+
+  // Radix-2 Cooley-Tukey FFT, in-place on real/imag arrays of length n = 2^k.
+  function fft(re, im) {
+    const n = re.length;
+    for (let i = 1, j = 0; i < n; i++) {
+      let bit = n >> 1;
+      for (; j & bit; bit >>= 1) j ^= bit;
+      j ^= bit;
+      if (i < j) {
+        const tr = re[i]; re[i] = re[j]; re[j] = tr;
+        const ti = im[i]; im[i] = im[j]; im[j] = ti;
+      }
+    }
+    for (let len = 2; len <= n; len <<= 1) {
+      const ang = -2 * Math.PI / len;
+      const wlr = Math.cos(ang), wli = Math.sin(ang);
+      for (let i = 0; i < n; i += len) {
+        let wr = 1, wi = 0;
+        for (let k = 0; k < len / 2; k++) {
+          const ur = re[i + k], ui = im[i + k];
+          const vr = re[i + k + len / 2] * wr - im[i + k + len / 2] * wi;
+          const vi = re[i + k + len / 2] * wi + im[i + k + len / 2] * wr;
+          re[i + k] = ur + vr; im[i + k] = ui + vi;
+          re[i + k + len / 2] = ur - vr; im[i + k + len / 2] = ui - vi;
+          const nwr = wr * wlr - wi * wli;
+          wi = wr * wli + wi * wlr;
+          wr = nwr;
+        }
+      }
+    }
+  }
+
+  // Spectral flatness: geometric mean / arithmetic mean of PSD.
+  // Near 1 for flat (white noise); much lower for structured (speech).
+  function spectralFlatness(frame) {
+    let n = 1;
+    while (n < frame.length) n <<= 1;
+    const re = new Float32Array(n);
+    const im = new Float32Array(n);
+    const L = frame.length;
+    for (let i = 0; i < L; i++) {
+      const w = 0.5 * (1 - Math.cos(2 * Math.PI * i / (L - 1)));
+      re[i] = frame[i] * w;
+    }
+    fft(re, im);
+    const half = n >> 1;
+    let logSum = 0, arithSum = 0, count = 0;
+    for (let k = 2; k < half; k++) {
+      const psd = re[k] * re[k] + im[k] * im[k] + 1e-12;
+      logSum += Math.log(psd);
+      arithSum += psd;
+      count++;
+    }
+    if (count === 0) return 1;
+    const geoMean = Math.exp(logSum / count);
+    const arithMean = arithSum / count;
+    return geoMean / (arithMean + 1e-12);
+  }
+
+  // Consecutive-sample clipping detector.
+  function clippedFrame(frame, thr, minRun) {
+    thr = thr || 0.98;
+    minRun = minRun || 3;
+    let run = 0;
+    for (let i = 0; i < frame.length; i++) {
+      if (Math.abs(frame[i]) >= thr) {
+        run++;
+        if (run >= minRun) return true;
+      } else {
+        run = 0;
+      }
+    }
+    return false;
+  }
+
+
+  // Simple linear resampler. Adequate for 48k→16k and 44.1k→16k; the
+  // aliasing introduced is small relative to the noise floor of consumer
+  // mics. For production-grade downsampling, run a proper anti-alias
+  // low-pass filter first (e.g. kaiser-designed FIR) or resample on the
+  // server where Python/libsoxr is available.
+  function resampleLinear(input, inRate, outRate) {
+    if (inRate === outRate) return input;
+    const ratio = inRate / outRate;
+    const outLen = Math.floor(input.length / ratio);
+    const output = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const srcIdx = i * ratio;
+      const idx0 = Math.floor(srcIdx);
+      const idx1 = Math.min(idx0 + 1, input.length - 1);
+      const frac = srcIdx - idx0;
+      output[i] = input[idx0] * (1 - frac) + input[idx1] * frac;
+    }
+    return output;
+  }
+
+  // Encode Float32 samples as 16-bit PCM WAV. Returns an ArrayBuffer.
+  // 16-bit is the standard for speech biomarker analysis; 32-bit float
+  // WAV would preserve more dynamic range but doubles file size and
+  // no mainstream tool benefits from it on already-quantised mic input.
+  function encodeWav(samples, sampleRate) {
+    const numSamples = samples.length;
+    const numChannels = 1;
+    const bytesPerSample = 2;
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = numSamples * bytesPerSample;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    // RIFF header
+    writeString(view, 0, 'RIFF');
+    view.setUint32(4, 36 + dataSize, true);
+    writeString(view, 8, 'WAVE');
+    // fmt chunk
+    writeString(view, 12, 'fmt ');
+    view.setUint32(16, 16, true);              // fmt chunk size
+    view.setUint16(20, 1, true);               // PCM format
+    view.setUint16(22, numChannels, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, 16, true);              // bits per sample
+    // data chunk
+    writeString(view, 36, 'data');
+    view.setUint32(40, dataSize, true);
+
+    // 16-bit PCM samples, clamped
+    let off = 44;
+    for (let i = 0; i < numSamples; i++) {
+      let s = samples[i];
+      if (s > 1) s = 1; else if (s < -1) s = -1;
+      view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      off += 2;
+    }
+    return buffer;
+  }
+
+  function writeString(view, offset, str) {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  }
+
+
+  /* ---------- platform / device fingerprinting ----------
+   * Pure UA-string parsing plus a keyword classifier for the mic
+   * label exposed by enumerateDevices(). All inputs are strings;
+   * none of these functions touch the AudioContext or stream.
+   * The classifier ordering is most-specific-first so that, e.g.,
+   * a "Blue Yeti USB Microphone" label resolves to external_mic
+   * (a studio mic) rather than usb_headset, and a
+   * "Plantronics Bluetooth headset" resolves to bluetooth (whose
+   * on-device DSP is the relevant covariate) rather than usb_headset.
+   * ----------------------------------------------------------------- */
+
+  function detectOS(ua) {
+    if (!ua) return 'unknown';
+    if (/iPhone|iPad|iPod/.test(ua)) return 'iOS';
+    if (/Android/.test(ua)) return 'Android';
+    if (/Windows/.test(ua)) return 'Windows';
+    if (/Macintosh|Mac OS X/.test(ua)) return 'macOS';
+    if (/Linux/.test(ua)) return 'Linux';
+    return 'unknown';
+  }
+
+  // Returns "<Name> <MajorVersion>" (e.g. "Chrome 130") or 'unknown'.
+  // Order matters: Edge UAs contain "Chrome", Chrome UAs contain "Safari".
+  function detectBrowser(ua) {
+    if (!ua) return 'unknown';
+    let m;
+    if ((m = ua.match(/Edg\/(\d+)/))) return 'Edge ' + m[1];
+    if ((m = ua.match(/Firefox\/(\d+)/))) return 'Firefox ' + m[1];
+    if (!/Edg\//.test(ua) && (m = ua.match(/Chrome\/(\d+)/))) return 'Chrome ' + m[1];
+    if (!/Chrome\//.test(ua) && (m = ua.match(/Version\/(\d+)[^)]*Safari/))) return 'Safari ' + m[1];
+    return 'unknown';
+  }
+
+  function detectDeviceClass(ua) {
+    if (!ua) return 'unknown';
+    if (/iPad|Tablet/.test(ua)) return 'tablet';
+    // Android UAs contain "Mobile" only on phones; tablet Android omits it.
+    if (/Android/.test(ua) && !/Mobile/.test(ua)) return 'tablet';
+    if (/Mobi|Android|iPhone|iPod/.test(ua)) return 'mobile';
+    if (/Macintosh|Windows|Linux/.test(ua)) return 'desktop';
+    return 'unknown';
+  }
+
+  // Keyword tables. Order of categories below is the priority order:
+  // each list is checked in turn, first match wins. Matching is on
+  // word boundaries so that, e.g., the brand keyword "blue" does NOT
+  // match inside "Bluetooth" (which would mis-route Bluetooth headsets
+  // into external_mic).
+  const MIC_KEYWORDS = [
+    ['external_mic',  [/\byeti\b/, /\bblue\b/, /\bshure\b/, /\baudio-technica\b/, /\brode\b/, /\brøde\b/, /\bat2020\b/]],
+    ['bluetooth',     [/\bbluetooth\b/, /\bairpods\b/, /\bgalaxy buds\b/, /\bbeats\b/, /\bwireless\b/]],
+    ['usb_headset',   [/\busb\b/, /\bplantronics\b/, /\blogitech\b/, /\bjabra\b/, /\bblackwire\b/, /\bevo\b/]],
+    ['laptop_builtin',[/\bbuilt-in\b/, /\binternal\b/, /\bmacbook\b/, /\brealtek\b/, /\bmicrophone array\b/, /\binternal microphone\b/]]
+  ];
+
+  function classifyMicLabel(label, deviceClass) {
+    const s = (label || '').toLowerCase();
+    for (let i = 0; i < MIC_KEYWORDS.length; i++) {
+      const cat = MIC_KEYWORDS[i][0];
+      const kws = MIC_KEYWORDS[i][1];
+      for (let j = 0; j < kws.length; j++) {
+        if (kws[j].test(s)) return cat;
+      }
+    }
+    // phone_builtin only when the platform is mobile and the browser
+    // gave us no real label (Safari/Firefox often return '' or 'default').
+    if (deviceClass === 'mobile' && (s === '' || s === 'default')) return 'phone_builtin';
+    return 'unknown';
+  }
+
+
+  // Running noise-floor estimator using minimum statistics on a
+  // sliding window of non-speech frame energies. The 10th percentile
+  // is used instead of the strict minimum for robustness.
+  function NoiseTracker(windowFrames) {
+    this.windowFrames = windowFrames || 150;
+    this.window = [];
+    this.current = -60;
+  }
+  NoiseTracker.prototype.update = function (dbfs) {
+    this.window.push(dbfs);
+    if (this.window.length > this.windowFrames) this.window.shift();
+    const sorted = this.window.slice().sort(function (a, b) { return a - b; });
+    const idx = Math.max(0, Math.floor(sorted.length * 0.1));
+    this.current = sorted[idx];
+  };
+  NoiseTracker.prototype.calibrate = function (dbfs) {
+    this.current = this.current === -60
+      ? dbfs
+      : 0.7 * this.current + 0.3 * dbfs;
+    this.window.push(dbfs);
+    if (this.window.length > this.windowFrames) this.window.shift();
+  };
+  NoiseTracker.prototype.reset = function () {
+    this.window = [];
+    this.current = -60;
+  };
+
+  // Running speech-level estimator: exponential moving average over
+  // frames classified as voiced.
+  function SpeechTracker(alpha) {
+    this.alpha = alpha || 0.1;
+    this.current = null;
+  }
+  SpeechTracker.prototype.update = function (dbfs) {
+    this.current = this.current === null
+      ? dbfs
+      : (1 - this.alpha) * this.current + this.alpha * dbfs;
+  };
+  SpeechTracker.prototype.reset = function () { this.current = null; };
+
+  /*
+   * Main class
+   */
+
+  const DEFAULTS = {
+    sampleRate: 16000,
+    frameMs: 30,
+    hopMs: 10,
+    calibrationMs: 2000,
+    thresholds: {
+      snrGood: 20,
+      snrWarn: 15,
+      vadEnergyDb: 6,
+      vadFlatMax: 0.4,
+      // Sustained-voicing gate. A frame is "confirmed voiced" only after
+      // vadMinRunFrames consecutive per-frame voiced classifications.
+      // 5 frames at 10 ms hop ≈ 50 ms — roughly the minimum syllable
+      // nucleus duration. Prevents single-frame transients (HVAC clicks,
+      // distant traffic, body movement) from polluting the speech-level
+      // EMA when the participant is silent.
+      vadMinRunFrames: 5,
+      // Warm-up gate. Number of confirmed-voiced frames that must
+      // accumulate after start() before the host UI should treat the
+      // SNR / verdict as meaningful. 100 frames at 10 ms hop = 1.0 s
+      // of speech. The engine still computes verdicts continuously;
+      // gating is the host's responsibility (see getMonitoringState).
+      warmupFrames: 100,
+      clipSampleThr: 0.98,
+      clipRunMin: 3,
+      minDurationSec: 1.5,
+      maxClipPct: 1.0,
+      minVoicedPct: 20
+    },
+    onFrame: null,
+    onVerdict: null,
+    onClipping: null,
+    onCalibrated: null,
+    onError: null,
+    uiThrottleMs: 60
+  };
+
+  function deepMerge(target, source) {
+    const out = {};
+    Object.keys(target).forEach(function (k) { out[k] = target[k]; });
+    if (!source) return out;
+    Object.keys(source).forEach(function (k) {
+      if (source[k] && typeof source[k] === 'object' && !Array.isArray(source[k])) {
+        out[k] = deepMerge(target[k] || {}, source[k]);
+      } else {
+        out[k] = source[k];
+      }
+    });
+    return out;
+  }
+
+  function GladAudioQC(opts) {
+    if (!(this instanceof GladAudioQC)) {
+      return new GladAudioQC(opts);
+    }
+    this.opts = deepMerge(DEFAULTS, opts || {});
+    this.ctx = null;
+    this.stream = null;
+    this.source = null;
+    this.worklet = null;
+    this.silentGain = null;
+    this.recorder = null;
+    this.recChunks = [];
+
+    this.noise = new NoiseTracker(150);
+    this.speech = new SpeechTracker();
+
+    this.mode = 'idle';
+    this.calibrated = false;
+    this._calibResolve = null;
+    this._calibStart = 0;
+
+    this._lastEmit = 0;
+    this._latestFrame = null;
+    this._frameCount = 0;
+    this._info = null;
+    this._rec = null;
+
+    // Voicing run-length state for the sustained-voicing VAD gate.
+    // _voicedRun = consecutive isVoiced frames seen so far (resets on
+    // any non-voiced frame). _confirmedVoicedFrames = total
+    // confirmed-voiced frames since the most recent calibrate()/start();
+    // drives the warm-up gate via getMonitoringState().
+    this._voicedRun = 0;
+    this._confirmedVoicedFrames = 0;
+  }
+
+  /* ---------- public API ---------- */
+
+  GladAudioQC.prototype.init = async function () {
+    if (this.ctx) return;
+    const sr = this.opts.sampleRate;
+    try {
+      this.stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          channelCount: 1,
+          sampleRate: sr
+        }
+      });
+    } catch (e) {
+      this._err('getUserMedia failed: ' + e.message);
+      throw e;
+    }
+
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    this.ctx = new Ctx({ sampleRate: sr });
+    const actualSr = this.ctx.sampleRate;
+
+    const frameSize = Math.round(actualSr * this.opts.frameMs / 1000);
+    const hopSize = Math.round(actualSr * this.opts.hopMs / 1000);
+
+    const blob = new Blob([WORKLET_SRC], { type: 'application/javascript' });
+    const url = URL.createObjectURL(blob);
+    await this.ctx.audioWorklet.addModule(url);
+    URL.revokeObjectURL(url);
+
+    this.source = this.ctx.createMediaStreamSource(this.stream);
+    this.worklet = new AudioWorkletNode(this.ctx, 'glad-framer', {
+      processorOptions: { frameSize: frameSize, hopSize: hopSize }
+    });
+    const self = this;
+    this.worklet.port.onmessage = function (ev) {
+      const msg = ev.data;
+      if (!msg) return;
+      if (msg.type === 'frame') {
+        self._onFrame(msg.data);
+      } else if (msg.type === 'raw') {
+        self._onRaw(msg.data);
+      }
+    };
+
+    this.silentGain = this.ctx.createGain();
+    this.silentGain.gain.value = 0;
+    this.source.connect(this.worklet);
+    this.worklet.connect(this.silentGain).connect(this.ctx.destination);
+
+    this._info = {
+      sampleRate: actualSr,
+      requestedSampleRate: sr,
+      frameSize: frameSize,
+      hopSize: hopSize
+    };
+  };
+
+  GladAudioQC.prototype.calibrate = async function () {
+    if (!this.ctx) await this.init();
+    this.noise.reset();
+    this.speech.reset();
+    this._voicedRun = 0;
+    this._confirmedVoicedFrames = 0;
+    this.calibrated = false;
+    this.mode = 'calibrating';
+    this._calibStart = performance.now();
+    const self = this;
+    return new Promise(function (resolve) {
+      self._calibResolve = resolve;
+    });
+  };
+
+  GladAudioQC.prototype.start = function () {
+    if (!this.calibrated) {
+      this._err('start() called before calibration complete');
+      return;
+    }
+    this._voicedRun = 0;
+    this._confirmedVoicedFrames = 0;
+    this.mode = 'monitoring';
+  };
+
+  GladAudioQC.prototype.record = async function (durationMs) {
+    if (!this.calibrated) {
+      throw new Error('calibrate() must complete before record()');
+    }
+    const deviceInfo = await this.getDeviceInfo();
+    const self = this;
+    this._rec = {
+      snrs: [],
+      clipFrames: 0,
+      totalFrames: 0,
+      voicedFrames: 0,
+      peak: -100,
+      startedAt: performance.now(),
+      deviceInfo: deviceInfo
+    };
+    this.recChunks = [];
+
+    let mimeType = 'audio/webm';
+    try {
+      if (!MediaRecorder.isTypeSupported(mimeType)) mimeType = '';
+    } catch (e) { mimeType = ''; }
+
+    this.recorder = mimeType
+      ? new MediaRecorder(this.stream, { mimeType: mimeType })
+      : new MediaRecorder(this.stream);
+
+    this.recorder.ondataavailable = function (ev) {
+      if (ev.data && ev.data.size) self.recChunks.push(ev.data);
+    };
+
+    const promise = new Promise(function (resolve) {
+      self.recorder.onstop = function () {
+        const blob = new Blob(self.recChunks, { type: self.recorder.mimeType || 'audio/webm' });
+        const report = self._finaliseRecording();
+        self.mode = 'monitoring';
+        resolve({ blob: blob, report: report });
+      };
+    });
+
+    this.recorder.start();
+    this.mode = 'recording';
+    if (durationMs) {
+      setTimeout(function () {
+        if (self.recorder && self.recorder.state === 'recording') self.recorder.stop();
+      }, durationMs);
+    }
+    return promise;
+  };
+
+  GladAudioQC.prototype.stopRecording = function () {
+    if (this.recorder && this.recorder.state === 'recording') {
+      this.recorder.stop();
+    }
+  };
+
+  /* ---------- PCM (WAV) recording ----------
+   * Captures raw Float32 samples from the AudioWorklet, resamples to
+   * targetSampleRate if needed (default 16 kHz), and encodes 16-bit PCM
+   * WAV. Use this instead of record() when lossless audio is required
+   * for acoustic feature extraction (jitter, shimmer, HNR, formants).
+   *
+   *   const { blob, report } = await qc.recordPCM(10000, { targetSampleRate: 16000 });
+   *   // blob is a WAV file; upload or offer for download.
+   * ----------------------------------------------------------------- */
+  GladAudioQC.prototype.recordPCM = async function (durationMs, opts) {
+    if (!this.calibrated) {
+      throw new Error('calibrate() must complete before recordPCM()');
+    }
+    opts = opts || {};
+    const targetSr = opts.targetSampleRate || 16000;
+    const deviceInfo = await this.getDeviceInfo();
+    const self = this;
+
+    this._rec = {
+      snrs: [],
+      clipFrames: 0,
+      totalFrames: 0,
+      voicedFrames: 0,
+      peak: -100,
+      startedAt: performance.now(),
+      deviceInfo: deviceInfo
+    };
+
+    this._pcm = {
+      chunks: [],        // array of Float32Array from the worklet
+      totalSamples: 0,
+      targetSr: targetSr,
+      active: true
+    };
+
+    // turn on raw capture in the worklet
+    this.worklet.port.postMessage({ type: 'captureRaw', on: true });
+    this.mode = 'recording';
+
+    const promise = new Promise(function (resolve) {
+      self._pcmResolve = resolve;
+    });
+
+    if (durationMs) {
+      setTimeout(function () {
+        if (self._pcm && self._pcm.active) self.stopRecordingPCM();
+      }, durationMs);
+    }
+    return promise;
+  };
+
+  GladAudioQC.prototype.stopRecordingPCM = function () {
+    if (!this._pcm || !this._pcm.active) return;
+    this._pcm.active = false;
+    this.worklet.port.postMessage({ type: 'captureRaw', on: false });
+
+    // flatten captured Float32 chunks
+    const ctxSr = this._info.sampleRate;
+    const flat = new Float32Array(this._pcm.totalSamples);
+    let off = 0;
+    for (let i = 0; i < this._pcm.chunks.length; i++) {
+      flat.set(this._pcm.chunks[i], off);
+      off += this._pcm.chunks[i].length;
+    }
+
+    // resample if needed (linear; adequate for 48k→16k and 44.1k→16k)
+    const targetSr = this._pcm.targetSr;
+    const samples = (Math.abs(ctxSr - targetSr) < 1) ? flat : resampleLinear(flat, ctxSr, targetSr);
+
+    const wav = encodeWav(samples, targetSr);
+    const blob = new Blob([wav], { type: 'audio/wav' });
+    const report = this._finaliseRecording();
+    report.format = 'wav_pcm16';
+    report.sample_rate_hz = targetSr;
+    report.context_sample_rate_hz = ctxSr;
+    report.resampled = (Math.abs(ctxSr - targetSr) >= 1);
+    report.pcm_samples = samples.length;
+
+    this.mode = 'monitoring';
+    this._pcm = null;
+    if (this._pcmResolve) {
+      this._pcmResolve({ blob: blob, report: report });
+      this._pcmResolve = null;
+    }
+  };
+
+  GladAudioQC.prototype.stop = async function () {
+    this.mode = 'idle';
+    if (this.recorder && this.recorder.state === 'recording') {
+      this.recorder.stop();
+    }
+    if (this._pcm && this._pcm.active) {
+      // abort PCM capture without producing a blob
+      this._pcm.active = false;
+      try { this.worklet.port.postMessage({ type: 'captureRaw', on: false }); } catch (e) {}
+      this._pcm = null;
+      if (this._pcmResolve) {
+        this._pcmResolve({ blob: null, report: null, aborted: true });
+        this._pcmResolve = null;
+      }
+    }
+    try {
+      if (this.source) this.source.disconnect();
+      if (this.worklet) this.worklet.disconnect();
+      if (this.silentGain) this.silentGain.disconnect();
+      if (this.stream) this.stream.getTracks().forEach(function (t) { t.stop(); });
+      if (this.ctx && this.ctx.state !== 'closed') await this.ctx.close();
+    } catch (e) { /* already closed */ }
+    this.ctx = null;
+    this.stream = null;
+    this.source = null;
+    this.worklet = null;
+    this.silentGain = null;
+    this.calibrated = false;
+  };
+
+  GladAudioQC.prototype.getMetrics = function () {
+    const noise = this.noise.current;
+    const signal = this.speech.current;
+    const snr = signal === null ? null : signal - noise;
+    return {
+      noiseFloorDbfs: noise,
+      signalDbfs: signal,
+      snrDb: snr,
+      verdict: snr === null ? null : this._classify(snr),
+      mode: this.mode,
+      calibrated: this.calibrated,
+      info: this._info || null
+    };
+  };
+
+  GladAudioQC.prototype.getReport = function () {
+    const m = this.getMetrics();
+    return {
+      snr_db: m.snrDb === null ? null : Number(m.snrDb.toFixed(2)),
+      noise_floor_dbfs: Number(m.noiseFloorDbfs.toFixed(2)),
+      signal_dbfs: m.signalDbfs === null ? null : Number(m.signalDbfs.toFixed(2)),
+      verdict: m.verdict,
+      sample_rate_hz: m.info ? m.info.sampleRate : null,
+      calibrated: m.calibrated,
+      user_agent: navigator.userAgent
+    };
+  };
+
+  // Warm-up state for the host UI / Qualtrics gate. Until
+  // monitoring_warmed_up is true, the verdict the engine is computing
+  // is based on too few confirmed-voiced frames to be meaningful and
+  // the host should suppress its display. The engine continues to
+  // compute and emit verdicts; gating is the host's responsibility.
+  GladAudioQC.prototype.getMonitoringState = function () {
+    const required = this.opts.thresholds.warmupFrames;
+    const confirmed = this._confirmedVoicedFrames;
+    return {
+      confirmed_voiced_frames: confirmed,
+      monitoring_warmed_up: confirmed >= required,
+      warmup_frames_required: required
+    };
+  };
+
+  /* ---------- device / platform metadata ----------
+   * Returns { platform, microphone, track_settings }, populated from
+   * navigator.userAgent, MediaStreamTrack.getSettings(), and
+   * navigator.mediaDevices.enumerateDevices(). Async because
+   * enumerateDevices() returns a Promise.
+   *
+   * Must be called after init() (i.e. mic permission granted), since
+   * enumerateDevices returns empty labels otherwise. Safe to call
+   * multiple times. Never throws — missing string fields return
+   * 'unknown', missing numeric/boolean fields return null.
+   * ----------------------------------------------------------------- */
+  GladAudioQC.prototype.getDeviceInfo = async function () {
+    const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+    const os = detectOS(ua);
+    const browser = detectBrowser(ua);
+    const deviceClass = detectDeviceClass(ua);
+
+    let micLabel = 'unknown';
+    let micDeviceId = 'unknown';
+    let sampleRate = null;
+    let channelCount = null;
+    let echoCancellation = null;
+    let noiseSuppression = null;
+    let autoGainControl = null;
+
+    if (this.stream) {
+      const tracks = this.stream.getAudioTracks();
+      if (tracks.length > 0) {
+        try {
+          const settings = (typeof tracks[0].getSettings === 'function')
+            ? tracks[0].getSettings() : null;
+          if (settings) {
+            if (typeof settings.sampleRate === 'number') sampleRate = settings.sampleRate;
+            if (typeof settings.channelCount === 'number') channelCount = settings.channelCount;
+            if (typeof settings.echoCancellation === 'boolean') echoCancellation = settings.echoCancellation;
+            if (typeof settings.noiseSuppression === 'boolean') noiseSuppression = settings.noiseSuppression;
+            if (typeof settings.autoGainControl === 'boolean') autoGainControl = settings.autoGainControl;
+            if (settings.deviceId) micDeviceId = settings.deviceId;
+          }
+        } catch (e) { /* sub-API unavailable; leave as defaults */ }
+
+        try {
+          if (navigator.mediaDevices && typeof navigator.mediaDevices.enumerateDevices === 'function') {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            let matched = null;
+            for (let i = 0; i < devices.length; i++) {
+              if (devices[i].kind === 'audioinput' && devices[i].deviceId === micDeviceId) {
+                matched = devices[i]; break;
+              }
+            }
+            if (!matched) {
+              for (let i = 0; i < devices.length; i++) {
+                if (devices[i].kind === 'audioinput') { matched = devices[i]; break; }
+              }
+            }
+            if (matched) {
+              if (matched.label) micLabel = matched.label;
+              if ((micDeviceId === 'unknown' || !micDeviceId) && matched.deviceId) {
+                micDeviceId = matched.deviceId;
+              }
+            }
+          }
+        } catch (e) { /* enumerateDevices unavailable; leave as defaults */ }
+      }
+    }
+
+    const micCategory = classifyMicLabel(micLabel === 'unknown' ? '' : micLabel, deviceClass);
+
+    return {
+      platform: {
+        user_agent: ua || 'unknown',
+        os: os,
+        browser: browser,
+        device_class: deviceClass
+      },
+      microphone: {
+        label: micLabel,
+        category: micCategory,
+        device_id: micDeviceId
+      },
+      track_settings: {
+        sample_rate: sampleRate,
+        channel_count: channelCount,
+        echo_cancellation: echoCancellation,
+        noise_suppression: noiseSuppression,
+        auto_gain_control: autoGainControl
+      }
+    };
+  };
+
+  /* ---------- internal ---------- */
+
+  GladAudioQC.prototype._onRaw = function (block) {
+    if (this._pcm && this._pcm.active) {
+      this._pcm.chunks.push(block);
+      this._pcm.totalSamples += block.length;
+    }
+  };
+
+  GladAudioQC.prototype._onFrame = function (frame) {
+    this._frameCount++;
+    this._latestFrame = frame;
+    const thr = this.opts.thresholds;
+
+    const rms = rmsDbfs(frame);
+    const pk = peakDbfs(frame);
+    const isClipped = clippedFrame(frame, thr.clipSampleThr, thr.clipRunMin);
+
+    let flatness = null;
+    if (this._frameCount % 2 === 0) flatness = spectralFlatness(frame);
+
+    if (this.mode === 'calibrating') {
+      this.noise.calibrate(rms);
+      if (performance.now() - this._calibStart >= this.opts.calibrationMs) {
+        this.calibrated = true;
+        this.mode = 'monitoring';
+        // Reset run-length / warm-up state at the calibration→monitoring
+        // transition (calibrate auto-promotes to monitoring without
+        // going through start()).
+        this._voicedRun = 0;
+        this._confirmedVoicedFrames = 0;
+        if (this.opts.onCalibrated) this.opts.onCalibrated({ noiseFloorDbfs: this.noise.current });
+        if (this._calibResolve) { this._calibResolve(); this._calibResolve = null; }
+      }
+      this._emit(rms, pk, null, null, isClipped);
+      return;
+    }
+
+    const energyAboveNoise = rms - this.noise.current;
+    const isVoiced =
+      energyAboveNoise > thr.vadEnergyDb &&
+      (flatness === null ? true : flatness < thr.vadFlatMax);
+
+    // Run-length gate. A frame counts as confirmed-voiced only after
+    // vadMinRunFrames consecutive isVoiced classifications. Three states:
+    //   - !isVoiced               → noise tracker updates
+    //   - isVoiced & not yet run  → neither tracker updates (transient)
+    //   - confirmed-voiced        → speech tracker updates
+    // Skipping ambiguous frames in BOTH trackers keeps the noise floor
+    // stable when speech is just beginning, and keeps the speech EMA
+    // clean of HVAC clicks / body movements / one-off transients.
+    if (isVoiced) {
+      this._voicedRun++;
+    } else {
+      this._voicedRun = 0;
+    }
+    const isConfirmedVoiced = this._voicedRun >= thr.vadMinRunFrames;
+
+    if (isConfirmedVoiced) {
+      this.speech.update(rms);
+      this._confirmedVoicedFrames++;
+    } else if (!isVoiced) {
+      this.noise.update(rms);
+    }
+
+    if (isClipped && this.opts.onClipping) this.opts.onClipping(this._frameCount);
+
+    if (this._rec && this.recorder && this.recorder.state === 'recording') {
+      this._rec.totalFrames++;
+      if (isClipped) this._rec.clipFrames++;
+      // voiced_pct in the report now means "confirmed-voiced fraction"
+      // (sustained voicing), not raw per-frame voiced — this is the
+      // correct value for downstream QC and matches the warm-up gate.
+      if (isConfirmedVoiced) this._rec.voicedFrames++;
+      if (pk > this._rec.peak) this._rec.peak = pk;
+      if (this.speech.current !== null) {
+        this._rec.snrs.push(this.speech.current - this.noise.current);
+      }
+    }
+
+    this._emit(rms, pk, isVoiced, isConfirmedVoiced, isClipped);
+  };
+
+  GladAudioQC.prototype._emit = function (rms, pk, isVoiced, isConfirmedVoiced, isClipped) {
+    const now = performance.now();
+    if (now - this._lastEmit < this.opts.uiThrottleMs) return;
+    this._lastEmit = now;
+
+    const noise = this.noise.current;
+    const signal = this.speech.current;
+    const snr = signal === null ? null : signal - noise;
+    const verdict = snr === null ? null : this._classify(snr);
+
+    if (this.opts.onFrame) {
+      this.opts.onFrame({
+        frameIndex: this._frameCount,
+        rmsDbfs: rms,
+        peakDbfs: pk,
+        noiseFloor: noise,
+        signalLevel: signal,
+        snr: snr,
+        isVoiced: isVoiced,
+        isConfirmedVoiced: isConfirmedVoiced,
+        isClipped: isClipped,
+        verdict: verdict,
+        latestFrame: this._latestFrame
+      });
+    }
+    if (this.opts.onVerdict && verdict !== null) {
+      this.opts.onVerdict({ level: verdict, snr: snr });
+    }
+  };
+
+  GladAudioQC.prototype._classify = function (snr) {
+    if (snr >= this.opts.thresholds.snrGood) return 'good';
+    if (snr >= this.opts.thresholds.snrWarn) return 'warn';
+    return 'bad';
+  };
+
+  GladAudioQC.prototype._finaliseRecording = function () {
+    const r = this._rec;
+    const thr = this.opts.thresholds;
+    const durSec = (performance.now() - r.startedAt) / 1000;
+    const meanSnr = r.snrs.length
+      ? r.snrs.reduce(function (a, b) { return a + b; }, 0) / r.snrs.length
+      : null;
+    const clipPct = r.totalFrames ? (r.clipFrames / r.totalFrames) * 100 : 0;
+    const voicedPct = r.totalFrames ? (r.voicedFrames / r.totalFrames) * 100 : 0;
+
+    const reasons = [];
+    if (durSec < thr.minDurationSec) reasons.push('too_short');
+    if (clipPct > thr.maxClipPct) reasons.push('clipping');
+    if (voicedPct < thr.minVoicedPct) reasons.push('insufficient_speech');
+    if (meanSnr !== null && meanSnr < thr.snrWarn) reasons.push('low_snr');
+
+    let verdict;
+    if (reasons.length === 0 && meanSnr !== null && meanSnr >= thr.snrGood) verdict = 'pass';
+    else if (reasons.length === 0) verdict = 'ok';
+    else verdict = 'fail';
+
+    this._rec = null;
+    return {
+      duration_sec: Number(durSec.toFixed(2)),
+      mean_snr_db: meanSnr === null ? null : Number(meanSnr.toFixed(2)),
+      clipped_pct: Number(clipPct.toFixed(3)),
+      voiced_pct: Number(voicedPct.toFixed(2)),
+      peak_dbfs: Number(r.peak.toFixed(2)),
+      verdict: verdict,
+      fail_reasons: reasons,
+      sample_rate_hz: this._info ? this._info.sampleRate : null,
+      user_agent: navigator.userAgent,
+      recorded_at_iso: new Date().toISOString(),
+      device_info: r.deviceInfo || null
+    };
+  };
+
+  GladAudioQC.prototype._err = function (msg) {
+    if (this.opts.onError) this.opts.onError(msg);
+  };
+
+  // expose helpers for advanced callers
+  GladAudioQC.dsp = {
+    rmsDbfs: rmsDbfs,
+    peakDbfs: peakDbfs,
+    spectralFlatness: spectralFlatness,
+    clippedFrame: clippedFrame,
+    resampleLinear: resampleLinear,
+    encodeWav: encodeWav,
+    NoiseTracker: NoiseTracker,
+    SpeechTracker: SpeechTracker,
+    detectOS: detectOS,
+    detectBrowser: detectBrowser,
+    detectDeviceClass: detectDeviceClass,
+    classifyMicLabel: classifyMicLabel
+  };
+
+  return GladAudioQC;
+}));
+
+Qualtrics.SurveyEngine.addOnReady(async function() {
+
+    const qContainer = this.getQuestionContainer();
+
+    const textBox = qContainer.querySelector('.InputText');
+    if (textBox) {
+        textBox.style.display = 'none';
+    }
+
+    this.hideNextButton();
+
+    qContainer.innerHTML += `
+    <style>
+        .qc-card {
+            margin: 20px auto;
+            padding: 32px;
+            border-radius: 16px;
+            background: #ffffff;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+            max-width: 550px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial;
+            text-align: center;
+        }
+        .qc-title {
+            font-size: 22px;
+            font-weight: 700;
+            margin-bottom: 16px;
+        }
+        .qc-instructions {
+            font-size: 15px;
+            line-height: 1.6;
+            color: #334155;
+            margin-bottom: 24px;
+            background: #f8fafc;
+            padding: 20px;
+            border-radius: 12px;
+            text-align: left;
+            border: 1px solid #e2e8f0;
+        }
+        .qc-instructions ol {
+            padding-left: 20px;
+        }
+        .qc-btn-primary {
+            padding: 14px 28px;
+            font-size: 16px;
+            font-weight: 600;
+            background: #2563eb;
+            color: #fff;
+            border: none;
+            border-radius: 10px;
+            cursor: pointer;
+        }
+        .qc-btn-secondary {
+            padding: 12px 24px;
+            font-size: 16px;
+            background: #f1f5f9;
+            border: 1px solid #cbd5e1;
+            border-radius: 8px;
+            display: none;
+            margin-top: 12px;
+            cursor: pointer;
+        }
+        .qc-status-panel {
+            margin-top: 24px;
+            padding: 16px;
+            border-radius: 8px;
+            background: #f1f5f9;
+            color: #475569;
+            font-size: 15px;
+        }
+    </style>
+
+    <div class="qc-card">
+        <div class="qc-title">🎤 Environmental Check</div>
+
+        <div class="qc-instructions">
+            To make sure your microphone is working properly:
+            <ol>
+                <li>Click <b>Start</b> below.</li>
+                <li>Stay <b>silent for 2 seconds</b>.</li>
+                <li>Then <b>speak clearly for 10 seconds</b>.</li>
+            </ol>
+        </div>
+
+        <button id="qc-start" class="qc-btn-primary">
+            ▶ Start microphone check
+        </button>
+
+        <button id="qc-retry" class="qc-btn-secondary">
+            ↺ Retry
+        </button>
+
+        <div id="qc-status" class="qc-status-panel">
+            Waiting to start...
+        </div>
+    </div>
+    `;
+
+    const statusEl = qContainer.querySelector("#qc-status");
+    const retryBtn = qContainer.querySelector("#qc-retry");
+    const startBtn = qContainer.querySelector("#qc-start");
+
+    let attempt = 0;
+
+    startBtn.addEventListener("click", () => {
+        startBtn.style.display = "none";
+        runQC();
+    });
+
+    const runQC = async () => {
+
+        retryBtn.style.display = "none";
+        this.hideNextButton();
+
+        attempt += 1;
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_attempt", attempt);
+
+        if (typeof GladAudioQC === "undefined") {
+            statusEl.innerHTML = "QC library not loaded";
+            return;
+        }
+
+        const qc = new GladAudioQC({
+            thresholds: {
+                snrGood: 20,
+                snrWarn: 15
+            }
+        });
+
+        let deviceInfo = null;
+
+        try {
+            await qc.init();
+        } catch (err) {
+            statusEl.innerHTML = "Microphone access denied";
+            return;
+        }
+
+        try {
+            deviceInfo = await qc.getDeviceInfo();
+        } catch (err) {}
+
+        statusEl.innerHTML = "Calibrating... please stay silent 🤫";
+
+        try {
+            await qc.calibrate();
+        } catch (err) {
+            statusEl.innerHTML = "Calibration failed";
+            return;
+        }
+
+        statusEl.innerHTML = "Recording... please speak 🗣️";
+
+        let result;
+
+        try {
+            result = await qc.record(10000);
+        } catch (err) {
+            statusEl.innerHTML = "Recording failed";
+            return;
+        }
+
+        const report = result.report || {};
+
+        // ✅ STORE EVERYTHING (UNCHANGED)
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_report_json", JSON.stringify(report));
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_snr", report.mean_snr_db);
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_duration", report.duration_sec);
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_voiced_pct", report.voiced_pct);
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_clipped_pct", report.clipped_pct);
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_engine_verdict", report.verdict);
+
+        // ✅ NEW COMPREHENSIVE EMBEDDED DATA BLOCK
+        if (deviceInfo) {
+
+            // platform info
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_device_os",
+                deviceInfo.platform.os || "");
+
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_device_browser",
+                deviceInfo.platform.browser || "");
+
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_device_class",
+                deviceInfo.platform.device_class || "");
+
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_user_agent",
+                deviceInfo.platform.user_agent || "");
+         
+            // microphone info
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_mic_label",
+                deviceInfo.microphone.label || "");
+
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_mic_category",
+                deviceInfo.microphone.category || "");
+
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_mic_device_id",
+                deviceInfo.microphone.device_id || "");
+         
+            // track settings (coerce to string to avoid Qualtrics type weirdness)
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_sample_rate",
+                deviceInfo.track_settings.sample_rate !== null
+                    ? String(deviceInfo.track_settings.sample_rate) : "");
+
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_channel_count",
+                deviceInfo.track_settings.channel_count !== null
+                    ? String(deviceInfo.track_settings.channel_count) : "");
+
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_echo_cancellation",
+                deviceInfo.track_settings.echo_cancellation !== null
+                    ? String(deviceInfo.track_settings.echo_cancellation) : "");
+
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_noise_suppression",
+                deviceInfo.track_settings.noise_suppression !== null
+                    ? String(deviceInfo.track_settings.noise_suppression) : "");
+
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_auto_gain_control",
+                deviceInfo.track_settings.auto_gain_control !== null
+                    ? String(deviceInfo.track_settings.auto_gain_control) : "");
+        }
+
+        const snr = Number(report.mean_snr_db);
+        const voiced = Number(report.voiced_pct);
+        const clipped = Number(report.clipped_pct);
+        const duration = Number(report.duration_sec);
+
+        let pass = true;
+
+        if (!snr || snr < 20) pass = false;
+        if (!voiced || voiced < 5) pass = false;
+        if (!duration || duration < 5) pass = false;
+        if (!isNaN(clipped) && clipped > 2) pass = false;
+
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_pass", pass ? "1" : "0");
+
+        // ✅ ONLY CHANGE — NO METRICS SHOWN
+        const statusColor = pass ? "#059669" : "#dc2626";
+
+        statusEl.innerHTML =
+            '<div style="font-weight:bold; color:' + statusColor + ';">' +
+            (pass ? "✅ Environment check passed" : "❌ Environment check failed") +
+            '</div>';
+
+        if (pass) {
+            this.showNextButton();
+        } else {
+            statusEl.innerHTML +=
+                '<div style="margin-top:10px;">Please try again in a quieter environment and speak clearly.</div>';
+            retryBtn.style.display = "inline-block";
+        }
+    };
+
+    retryBtn.addEventListener("click", () => {
+        startBtn.style.display = "inline-block";
+        retryBtn.style.display = "none";
+        statusEl.innerHTML = "Waiting to start...";
+    });
+
+});
+
+
+
+
+

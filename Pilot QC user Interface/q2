@@ -1,0 +1,317 @@
+var globalIntervalIdQ2 = null; // Globally scoped to clear reliably on unload
+
+Qualtrics.SurveyEngine.addOnReady(function () {
+
+  var _this = this;
+  var qid = this.questionId;
+
+  // ✅ Question 2 Embedded Data defaults
+  Qualtrics.SurveyEngine.setEmbeddedData("q2_speech_sec", 0);
+
+  // ----------------------------------------------------------
+  // ✅ MINIMALIST PLAIN-TEXT NOTIFICATION
+  // ----------------------------------------------------------
+  var statusNotice = document.createElement("div");
+  statusNotice.style.margin = "20px auto 10px auto"; // Separates text cleanly from recorder elements
+  statusNotice.style.fontSize = "16px";
+  statusNotice.style.fontWeight = "600";
+  statusNotice.style.color = "#475569"; 
+  statusNotice.style.textAlign = "center";
+  statusNotice.style.width = "100%";
+  statusNotice.innerText = "🎙️ Preparing mic...";
+
+  // ----------------------------------------------------------
+  // ✅ AUTO SELECT AUDIO + REMOVE VIDEO BUTTON
+  // ----------------------------------------------------------
+  setTimeout(function () {
+    var buttons = document.querySelectorAll("button");
+    for (var i = 0; i < buttons.length; i++) {
+      var txt = buttons[i].innerText ? buttons[i].innerText.toLowerCase() : "";
+
+      if (txt.indexOf("video") !== -1) {
+        buttons[i].style.display = "none";
+      }
+
+      if (txt.indexOf("record audio") !== -1) {
+        buttons[i].click(); // Automatically triggers the panel setup
+      }
+    }
+
+    // 📍 PLACEMENT FIX: Inserts notice cleanly underneath the native recorder block
+    var container = document.querySelector("#" + qid + " .QuestionBody") || document.getElementById(qid);
+    if (container) {
+      container.appendChild(statusNotice);
+    }
+  }, 1000);
+
+  // ----------------------------------------------------------
+  // ✅ PARAMETERS & TIMING SETUP
+  // ----------------------------------------------------------
+  var CALIBRATION_MS = 3000; 
+  var HANGOVER_MS = 600;
+  var ZCR_MAX = 0.25;
+
+  var totalSpeechMs = 0;
+  var totalRecordingMs = 0;
+  var lastTimestamp = null;
+
+  var smoothedRMS = 0;
+  var lastSpeechTime = null;
+
+  var calibrated = false;
+  var calibrationStart = null; 
+  var noiseDbfs = -60;
+  var speechDbfs = null;
+
+  var isRecording = false;
+  var loopStopped = false;
+
+  // ----------------------------------------------------------
+  // ✅ STOP DETECTION
+  // ----------------------------------------------------------
+  function detectStop() {
+    globalIntervalIdQ2 = setInterval(function () {
+      var buttons = document.querySelectorAll("button");
+
+      for (var i = 0; i < buttons.length; i++) {
+        var txt = buttons[i].innerText ? buttons[i].innerText.toLowerCase() : "";
+
+        if (txt.indexOf("delete") !== -1) {
+          if (isRecording && !loopStopped) {
+            isRecording = false;
+            loopStopped = true;
+
+            if (_this.animationId) {
+              cancelAnimationFrame(_this.animationId);
+              _this.animationId = null;
+            }
+
+            statusNotice.innerText = "⏹️ Recording complete.";
+            statusNotice.style.color = "#475569";
+            _this.saveMetrics();
+          }
+        }
+      }
+    }, 400);
+  }
+
+  detectStop();
+
+  // ----------------------------------------------------------
+  // ✅ AUDIO STREAM SETUP
+  // ----------------------------------------------------------
+  navigator.mediaDevices.getUserMedia({
+    audio: {
+      autoGainControl: false,
+      echoCancellation: false,
+      noiseSuppression: false
+    }
+  }).then(function(stream) {
+
+    _this.micStream = stream;
+
+    var AudioContext = window.AudioContext || window.webkitAudioContext;
+    var ctx = new AudioContext();
+
+    document.body.addEventListener("click", function () {
+      if (ctx.state === "suspended") ctx.resume();
+    });
+
+    var mic = ctx.createMediaStreamSource(stream);
+    var analyser = ctx.createAnalyser();
+    analyser.fftSize = 1024;
+    mic.connect(analyser);
+
+    var buffer = new Uint8Array(analyser.fftSize);
+
+    function loop(timestamp) {
+      if (!_this.micStream || loopStopped) return;
+
+      if (!lastTimestamp) lastTimestamp = timestamp;
+      var delta = timestamp - lastTimestamp;
+      lastTimestamp = timestamp;
+
+      if (!calibrationStart) {
+        calibrationStart = timestamp;
+      }
+
+      analyser.getByteTimeDomainData(buffer);
+
+      var sumSq = 0;
+      var zc = 0;
+      var lastSign = (buffer[0] - 128) > 0;
+
+      for (var i = 0; i < buffer.length; i++) {
+        var v = (buffer[i] - 128) / 128;
+        sumSq += v * v;
+
+        var sign = v > 0;
+        if (sign !== lastSign) {
+          zc++;
+          lastSign = sign;
+        }
+      }
+
+      var rms = Math.sqrt(sumSq / buffer.length);
+      var zcr = zc / buffer.length;
+
+      smoothedRMS = 0.8 * smoothedRMS + 0.2 * rms;
+
+      var currentDb = smoothedRMS > 1e-10
+        ? 20 * Math.log(smoothedRMS) / Math.LN10
+        : -100;
+
+      // ✅ FIXED CALIBRATION WINDOW
+      if (!calibrated) {
+        if (timestamp - calibrationStart < CALIBRATION_MS) {
+          statusNotice.innerText = "🔇 Calibrating environment... Please stay quiet.";
+          
+          noiseDbfs = (noiseDbfs === -60)
+            ? currentDb
+            : 0.8 * noiseDbfs + 0.2 * currentDb;
+
+          _this.animationId = requestAnimationFrame(loop);
+          return;
+        } else {
+          calibrated = true;
+          statusNotice.innerText = "✅ Ready — you may start speaking now. Please Click the red button once you are ready.";
+          statusNotice.style.color = "#16a34a"; 
+        }
+      }
+
+      // ✅ START DETECTION
+      if (!isRecording) {
+        if (currentDb > noiseDbfs + 10) {
+          isRecording = true;
+          totalSpeechMs = 0;
+          totalRecordingMs = 0;
+          speechDbfs = null;
+          lastSpeechTime = null;
+        } else {
+          _this.animationId = requestAnimationFrame(loop);
+          return;
+        }
+      }
+
+      totalRecordingMs += delta;
+
+      var speaking = (currentDb > noiseDbfs + 6) && (zcr < ZCR_MAX);
+
+      if (!speaking) {
+        noiseDbfs = 0.9 * noiseDbfs + 0.1 * currentDb;
+      }
+
+      if (speaking) {
+        totalSpeechMs += delta;
+
+        if (speechDbfs === null) {
+          speechDbfs = currentDb;
+        } else {
+          speechDbfs = 0.9 * speechDbfs + 0.1 * currentDb;
+        }
+
+        lastSpeechTime = timestamp;
+      } else if (lastSpeechTime && (timestamp - lastSpeechTime < HANGOVER_MS)) {
+        totalSpeechMs += delta;
+      }
+
+      _this.animationId = requestAnimationFrame(loop);
+    }
+
+    _this.animationId = requestAnimationFrame(loop);
+
+    // ----------------------------------------------------------
+    // ✅ SAVE METRICS (Configured for q2 Fields)
+    // ----------------------------------------------------------
+    function saveMetrics() {
+      var speechSec = totalSpeechMs / 1000;
+      var ratio = totalRecordingMs > 0 ? totalSpeechMs / totalRecordingMs : 0;
+      var meanSNR = (speechDbfs !== null) ? (speechDbfs - noiseDbfs) : 0;
+      var voiced_pct = totalRecordingMs > 0 ? (totalSpeechMs / totalRecordingMs) * 100 : 0;
+
+      Qualtrics.SurveyEngine.setEmbeddedData("q2_speech_sec", Math.round(speechSec));
+      Qualtrics.SurveyEngine.setEmbeddedData("q2_snr", meanSNR.toFixed(2));
+      Qualtrics.SurveyEngine.setEmbeddedData("q2_speech_ratio", ratio.toFixed(3));
+      Qualtrics.SurveyEngine.setEmbeddedData("q2_voiced_pct", voiced_pct.toFixed(1));
+    }
+
+    _this.saveMetrics = saveMetrics;
+  }).catch(function(err) {
+    console.error(err);
+    statusNotice.innerText = "❌ Microphone access blocked or unavailable.";
+    statusNotice.style.color = "#dc2626";
+  });
+
+  // ----------------------------------------------------------
+  // ✅ IDEAS ELEMENT 
+  // ----------------------------------------------------------
+  setTimeout(function () {
+    const helperContainer = document.createElement("div");
+    helperContainer.style.marginTop = "25px"; 
+    helperContainer.style.marginBottom = "15px";
+
+    const toggleBtn = document.createElement("button");
+    toggleBtn.innerText = "💡 Need ideas on what to say?";
+    toggleBtn.style.padding = "10px 16px";
+    toggleBtn.style.background = "#005bb5";
+    toggleBtn.style.color = "#ffffff";
+    toggleBtn.style.border = "2px solid #003f7a";
+    toggleBtn.style.borderRadius = "6px";
+    toggleBtn.style.cursor = "pointer";
+    toggleBtn.style.fontSize = "14px";
+    toggleBtn.style.fontWeight = "bold";
+
+    const promptsDiv = document.createElement("div");
+    promptsDiv.style.display = "none";
+    promptsDiv.style.marginTop = "10px";
+    promptsDiv.style.padding = "15px";
+    promptsDiv.style.background = "#fff8c4";
+    promptsDiv.style.borderLeft = "5px solid #ffcc00";
+    promptsDiv.style.color = "#333333";
+    promptsDiv.style.borderRadius = "4px";
+    promptsDiv.style.fontSize = "15px";
+
+    promptsDiv.innerHTML =
+      "<strong>If you aren't sure what to talk about, try:</strong>" +
+      "<ul style='margin-top:8px; padding-left:20px;'>" +
+        "<li>Walk me through your morning routine today.</li>" +
+        "<li>Describe the plot of your favourite movie or book.</li>" +
+        "<li>What are you looking forward to this week?</li>" +
+      "</ul>";
+
+    toggleBtn.addEventListener("click", function (e) {
+      e.preventDefault();
+      if (promptsDiv.style.display === "none") {
+        promptsDiv.style.display = "block";
+        toggleBtn.innerText = "🔼 Hide ideas";
+      } else {
+        promptsDiv.style.display = "none";
+        toggleBtn.innerText = "💡 Need ideas on what to say?";
+      }
+    });
+
+    helperContainer.appendChild(toggleBtn);
+    helperContainer.appendChild(promptsDiv);
+
+    const container = document.querySelector(".QuestionBody") || document.body;
+    container.appendChild(helperContainer);
+  }, 800);
+
+});
+
+// ----------------------------------------------------------
+Qualtrics.SurveyEngine.addOnPageSubmit(function () {
+  if (this.saveMetrics) this.saveMetrics();
+});
+
+Qualtrics.SurveyEngine.addOnUnload(function () {
+  if (this.animationId) cancelAnimationFrame(this.animationId);
+  if (this.saveMetrics) this.saveMetrics();
+  
+  if (typeof globalIntervalIdQ2 !== "undefined" && globalIntervalIdQ2 !== null) {
+    clearInterval(globalIntervalIdQ2);
+  }
+  if (this.micStream) {
+    this.micStream.getTracks().forEach(function (t) { t.stop(); });
+  }
+});
