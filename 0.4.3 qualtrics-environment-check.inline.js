@@ -4120,21 +4120,22 @@ if (!window.GLAD_QC) {
   G.env = (function () {
     const UI = { status: 'gladqc-status', snr: 'gladqc-snr', noise: 'gladqc-noise', signal: 'gladqc-signal', button: 'gladqc-check', prompt: 'gladqc-prompt' };
 
-    function ensureUi(qobj) {
+function ensureUi(qobj) {
       let host = null;
       safe(function () { host = qobj.getQuestionContainer(); });
       if (!host) host = doc.getElementById('question-' + qobj.questionId) || doc.getElementById(qobj.questionId) || doc.body;
-      if (doc.getElementById(UI.button)) return host;
-      const box = doc.createElement('div');
-      box.className = 'gladqc-box';
-      box.innerHTML =
-        '<div id="' + UI.status + '" class="gladqc-status">Ready. Press Start, then stay silent for 3 seconds.</div>' +
-        '<div id="' + UI.prompt + '" class="gladqc-prompt" style="display:none"></div>' +
-        '<div class="gladqc-readout"><span>SNR <strong id="' + UI.snr + '">—</strong></span> ' +
-        '<span>Noise floor <strong id="' + UI.noise + '">—</strong></span> ' +
-        '<span>Signal <strong id="' + UI.signal + '">—</strong></span></div>' +
-        '<button type="button" id="' + UI.button + '" class="gladqc-button">Start</button>';
-      host.appendChild(box);
+      if (!doc.getElementById(UI.button)) {
+        const box = doc.createElement('div');
+        box.className = 'gladqc-box';
+        box.innerHTML =
+          '<div id="' + UI.status + '" class="gladqc-status">Ready. Press Start, then stay silent for 3 seconds.</div>' +
+          '<div id="' + UI.prompt + '" class="gladqc-prompt" style="display:none"></div>' +
+          '<div class="gladqc-readout"><span>SNR <strong id="' + UI.snr + '">—</strong></span> ' +
+          '<span>Noise floor <strong id="' + UI.noise + '">—</strong></span> ' +
+          '<span>Signal <strong id="' + UI.signal + '">—</strong></span></div>' +
+          '<button type="button" id="' + UI.button + '" class="gladqc-button">Start</button>';
+        host.appendChild(box);
+      }
       return host;
     }
     function el(id) { return doc.getElementById(id); }
