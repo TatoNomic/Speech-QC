@@ -4146,7 +4146,7 @@ function ensureUi(qobj) {
     // 10 s measurement -> fields -> Next or one Retry) on the v0.4
     // session engine: no engine-side recording, the alpha's qc_* names,
     // and the gate is speech presence only (see decide()).
-    function mount(qobj, opts) {
+   function mount(qobj, opts) {
       opts = opts || {};
       const S = { qobj: qobj, attempts: 0, t0: now(), released: false, forced: false, engine: null, calibration: null, report: null,
                   lastVerdict: null, warmed: false, error: null, gate: null, clipAdvice: null, timers: {} };
@@ -4157,48 +4157,67 @@ function ensureUi(qobj) {
       ensureUi(qobj);
       const p = G.runProbe();
       if (!p.eval.ok) {
-        // ABSENT required capability: the only reason to stop. Record it and let the survey branch on qc_probe_ok.
         setStatus('This browser cannot run the audio check (missing: ' + p.eval.missing.join(', ') + '). You can continue.', 'bad');
         S.error = 'probe_missing:' + p.eval.missing.join(',');
         writeEnv(S, null);
         releaseNext(S, 'probe_missing');
         return S;
       }
-      el(UI.button).addEventListener('click', function () { onStart(S); });   // gesture: unlock + getUserMedia happen inside
+
+      // Attach directly by element ID lookup
+      const checkBtn = el(UI.button);
+      if (checkBtn) {
+        checkBtn.onclick = function () { onStart(S); };
+      }
+
       S.timers.wait = setTimeout(function () {
         if (!S.released) { S.forced = true; S.gate = 'forced'; writeEnv(S, null); releaseNext(S, 'max_wait'); }
       }, G.config.env.maxWaitMs);
       return S;
     }
 
-    function onStart(S) {
+    async function onStart(S) {
       S.attempts++;
-      const btn = el(UI.button); btn.disabled = true;
-      const ens = G.ensureEngine({ noRestore: true });   // the environment check always calibrates live
+      const btn = el(UI.button); 
+      if (btn) btn.disabled = true;
+      const ens = G.ensureEngine({ noRestore: true });
       const e = S.engine = ens.engine;
       G._frameHandler = function (m) { onFrame(S, m); };
-      e.unlock();                                        // iOS: AudioContext inside the click
-      setStatus('Calibrating — please stay silent…', '');
+      
+      safe(function () { e.unlock(); });
+
+      setStatus('Accessing microphone…', '');
       const cal = G.config.calibration;
       G._engineGum = true;
-      const prom = e.calibrateTwoPhase({
-        silenceMs: cal.silenceMs, speechMs: cal.speechMs,
-        onPhase: function (ph) {
-          if (ph === 'silence') { setStatus('Stay silent for ' + Math.round(cal.silenceMs / 1000) + ' seconds…', ''); setPrompt(null); }
-          else { setStatus('Now read this aloud:', ''); setPrompt('“' + cal.prompt + '”'); }
-        }
-      });
-      G._engineGum = false;
-      prom.then(function (baseline) {
+
+      try {
+        await e.init();
+
+        setStatus('Calibrating — please stay silent…', '');
+        const baseline = await e.calibrateTwoPhase({
+          silenceMs: cal.silenceMs, speechMs: cal.speechMs,
+          onPhase: function (ph) {
+            if (ph === 'silence') { setStatus('Stay silent for ' + Math.round(cal.silenceMs / 1000) + ' seconds…', ''); setPrompt(null); }
+            else { setStatus('Now read this aloud:', ''); setPrompt('“' + cal.prompt + '”'); }
+          }
+        });
+
         S.calibration = baseline;
         e.start();
         measure(S);
-      }, function (err) {
+      } catch (err) {
         S.error = 'calibrate:' + String(err && err.name || err);
         setStatus('Could not access the microphone. Please allow microphone access and press Start again.', 'bad');
-        btn.disabled = false;
-        if (S.attempts >= G.config.env.maxAttempts) { S.forced = true; S.gate = 'forced'; writeEnv(S, null); releaseNext(S, 'max_attempts'); }
-      });
+        if (btn) btn.disabled = false;
+        if (S.attempts >= G.config.env.maxAttempts) { 
+          S.forced = true; 
+          S.gate = 'forced'; 
+          writeEnv(S, null); 
+          releaseNext(S, 'max_attempts'); 
+        }
+      } finally {
+        G._engineGum = false;
+      }
     }
 
     // The alpha's 10-second qc.record(10000) becomes a 10-second question
