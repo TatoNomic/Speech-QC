@@ -4501,3 +4501,440 @@ if (window.GladAudioQC && window.GLAD_QC && typeof window.GLAD_QC.headerInit ===
   });
 }());
 /* ==== end of qualtrics-environment-check.inline.js (paste check: this line must be present) ==== */
+
+/* ==================================================================
+ * ESTEBAN'S ENVIRONMENT CHECK UI & KAVAN ENGINE GATING
+ * ================================================================== */
+Qualtrics.SurveyEngine.addOnload(function () {
+    /* Ready */
+});
+
+Qualtrics.SurveyEngine.addOnReady(async function () {
+    var qContainer = this.getQuestionContainer();
+    var textBox = qContainer.querySelector('.InputText');
+    if (textBox) textBox.style.display = 'none';
+
+    this.hideNextButton();
+
+    qContainer.innerHTML = 
+      '<style>' +
+      '  .qc-card { max-width: 550px; margin: 16px auto; padding: 24px 16px; border: 1px solid #ddd; border-radius: 8px; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; text-align: center; }' +
+      '  .qc-card h3 { margin-top: 0; font-size: 20px; }' +
+      '  .qc-buttons { display: flex; gap: 10px; justify-content: center; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }' +
+      '  .qc-card button { min-height: 48px; min-width: 120px; padding: 12px 28px; font-size: 16px; border: none; border-radius: 8px; background: #2563eb; color: #fff; cursor: pointer; }' +
+      '  #qc-retry { background: #f1f5f9; color: #334155; border: 1px solid #cbd5e1; }' +
+      '  #qc-instructions { margin-bottom: 12px; font-size: 16px; line-height: 1.5; }' +
+      '  #qc-status { font-size: 15px; line-height: 1.5; }' +
+      '</style>' +
+      '<div class="qc-card">' +
+      '  <h3>🎤 Environmental Check</h3>' +
+      '  <div id="qc-instructions">Welcome! This check ensures your microphone and environment are ready. <br><br>Please sit in a quiet room, then click <b>Begin Check</b> below.</div>' +
+      '  <div class="qc-buttons">' +
+      '    <button id="qc-action-btn" type="button">Begin Check</button>' +
+      '    <button id="qc-retry" type="button" style="display:none;">Retry</button>' +
+      '  </div>' +
+      '  <div id="qc-status">Waiting to start...</div>' +
+      '</div>' +
+      '<div id="qc-silence-progress-container" style="display:none; width:100%; max-width:550px; margin: 0 auto 20px auto; background-color:#eee; border-radius:12px; height:24px; overflow:hidden;">' +
+      '  <div id="qc-silence-progress-bar" style="width:100%; height:100%; background-color:#2563eb; transition: width 0.1s linear;"></div>' +
+      '</div>' +
+      '<div id="qc-progress-container" style="display:none; width:100%; max-width:550px; margin: 0 auto 20px auto; background-color:#eee; border-radius:12px; height:24px; overflow:hidden;">' +
+      '  <div id="qc-progress-bar" style="width:100%; height:100%; background-color:#2563eb; transition: width 0.1s linear;"></div>' +
+      '</div>';
+
+    var statusEl = qContainer.querySelector("#qc-status");
+    var instructionsEl = qContainer.querySelector("#qc-instructions");
+    var actionBtn = qContainer.querySelector("#qc-action-btn");
+    var retryBtn = qContainer.querySelector("#qc-retry");
+    var silenceProgressContainer = qContainer.querySelector("#qc-silence-progress-container");
+    var silenceProgressBar = qContainer.querySelector("#qc-silence-progress-bar");
+    var progressContainer = qContainer.querySelector("#qc-progress-container");
+    var progressBar = qContainer.querySelector("#qc-progress-bar");
+
+    var attempt = 0;
+    var qc = null;
+    var qEngine = this;
+
+    var revealNext = function () {
+        if (qEngine && typeof qEngine.showNextButton === "function") {
+            qEngine.showNextButton();
+        }
+        if (qEngine && typeof qEngine.enableNextButton === "function") {
+            qEngine.enableNextButton();
+        }
+
+        var nextSelectors = [
+            '#NextButton',
+            '#next-button',
+            '.NextButton',
+            'button[title="Next"]',
+            'input[value="→"]',
+            'input[value="Next"]',
+            '#Buttons #NextButton',
+            '.Skin #Buttons #NextButton'
+        ];
+
+        nextSelectors.forEach(function (sel) {
+            var el = document.querySelector(sel);
+            if (el) {
+                el.style.display = 'inline-block';
+                el.style.visibility = 'visible';
+                el.disabled = false;
+                el.removeAttribute('disabled');
+            }
+        });
+
+        var buttonContainer = document.getElementById('Buttons') || document.querySelector('.Skin #Buttons');
+        if (buttonContainer) {
+            buttonContainer.style.display = 'block';
+            buttonContainer.style.visibility = 'visible';
+        }
+    };
+
+    var resetUI = function () {
+        actionBtn.style.display = "inline-block";
+        actionBtn.innerHTML = "Begin Check";
+        actionBtn.style.backgroundColor = "#2563eb";
+        retryBtn.style.display = "none";
+        silenceProgressContainer.style.display = "none";
+        progressContainer.style.display = "none";
+        instructionsEl.innerHTML = "Welcome! This check ensures your microphone and environment are ready. <br><br>Please sit in a quiet room, then click <b>Begin Check</b> below.";
+        statusEl.innerHTML = "Waiting to start...";
+    };
+
+    actionBtn.addEventListener("click", async function () {
+        var currentState = actionBtn.innerHTML;
+        if (currentState === "Begin Check") {
+            actionBtn.style.display = "none"; 
+            await runSilencePhase();
+        } else if (currentState === "Start Reading") {
+            actionBtn.style.display = "none";
+            await runSpeechPhase();
+        } else if (currentState === "Start 10s Recording") {
+            actionBtn.style.display = "none";
+            await runRecordingPhase();
+        }
+    });
+
+    retryBtn.addEventListener("click", async function () {
+        if (qc) {
+            try { await qc.stop(); } catch(e) {}
+            qc = null;
+        }
+        resetUI();
+    });
+
+    // STEP 1: SILENCE MEASUREMENT & SILENCE VALIDATION GATE
+    var runSilencePhase = async function () {
+        try {
+            retryBtn.style.display = "none";
+            qEngine.hideNextButton();
+
+            attempt += 1;
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_attempt", String(attempt));
+
+            if (typeof GladAudioQC === "undefined") {
+                statusEl.innerHTML = "Error: GladAudioQC library is missing.";
+                return;
+            }
+
+            qc = new GladAudioQC();
+            qc.unlock();
+
+            try {
+                await qc.init();
+            } catch (err) {
+                statusEl.innerHTML = "Microphone access denied. Please allow permissions and retry.";
+                retryBtn.style.display = "inline-block";
+                return;
+            }
+
+            var prepTime = 3;
+            instructionsEl.innerHTML = "⚠️ <b style='color:#EF6C00;'>Get ready to be completely silent...</b><br><br>Do not touch your device or desk.";
+            statusEl.innerHTML = "Starting in " + prepTime + "...";
+
+            var prepInterval = setInterval(async function () {
+                prepTime--;
+                if (prepTime > 0) {
+                    statusEl.innerHTML = "Starting in " + prepTime + "...";
+                } else {
+                    clearInterval(prepInterval);
+
+                    instructionsEl.innerHTML = "🤫 <b style='color:#2563eb;'>Stay completely silent now.</b> <br><br>Measuring background noise...";
+                    statusEl.innerHTML = "Measuring noise floor...";
+
+                    silenceProgressContainer.style.display = "block";
+                    silenceProgressBar.style.width = "100%";
+
+                    var totalTime = 5000;
+                    var step = 100;
+                    var elapsed = 0;
+
+                    var barInterval = setInterval(function () {
+                        elapsed += step;
+                        var pct = Math.max(0, 100 - (elapsed / totalTime) * 100);
+                        silenceProgressBar.style.width = pct + "%";
+                        if (elapsed >= totalTime) clearInterval(barInterval);
+                    }, step);
+
+                    try {
+                        qc.opts.calibrationMs = totalTime;
+                        await qc.calibrate();
+
+                        clearInterval(barInterval);
+                        silenceProgressContainer.style.display = "none";
+
+                        var maxSilenceAllowed = (qc.opts && qc.opts.env && qc.opts.env.calibrationFloorMaxDbfs) ? qc.opts.env.calibrationFloorMaxDbfs : -40.0;
+                        var measuredFloor = (qc.noiseFloorDbfs != null) ? qc.noiseFloorDbfs : -99;
+
+                        Qualtrics.SurveyEngine.setEmbeddedData("qc_noise_floor", String(measuredFloor));
+
+                        if (measuredFloor > maxSilenceAllowed) {
+                            statusEl.innerHTML = 
+                                "<b style='color:#dc2626;'>❌ Noise or talking detected during silence (" + measuredFloor.toFixed(1) + " dBFS, must be ≤ " + maxSilenceAllowed + " dBFS).</b><br><br>" +
+                                "Please remain completely quiet and retry.";
+                            retryBtn.style.display = "inline-block";
+                            return;
+                        }
+
+                        statusEl.innerHTML = "Silence measurement complete (" + measuredFloor.toFixed(1) + " dBFS).";
+                        instructionsEl.innerHTML = 
+                            "🗣️️ <b>Voice Calibration Step</b><br><br>" +
+                            "You will read the following text aloud:<br>" +
+                            "<span style='font-size:18px;color:#111;display:block;margin:15px 0;'><b>\"The quick brown fox jumps over the lazy dog\"</b></span>" +
+                            "Click below when you are ready to read.";
+                        actionBtn.innerHTML = "Start Reading";
+                        actionBtn.style.backgroundColor = "#2E7D32";
+                        actionBtn.style.display = "inline-block";
+                    } catch (err) {
+                        clearInterval(barInterval);
+                        silenceProgressContainer.style.display = "none";
+                        statusEl.innerHTML = "Calibration failed.";
+                        retryBtn.style.display = "inline-block";
+                    }
+                }
+            }, 1000);
+
+        } catch (err) {
+            statusEl.innerHTML = "Calibration failed.";
+            retryBtn.style.display = "inline-block";
+        }
+    };
+
+    // STEP 2: VOICE BASELINE CAPTURE & BASELINE VALIDATION GATE
+    var runSpeechPhase = async function () {
+        instructionsEl.innerHTML = 
+            "🗣️ <b>Read aloud clearly now:</b><br><br>" +
+            "<b style='font-size:18px;'>The quick brown fox jumps over the lazy dog</b>";
+        statusEl.innerHTML = "Measuring voice baseline...";
+
+        progressContainer.style.display = "block";
+        progressBar.style.width = "100%";
+        progressBar.style.backgroundColor = "#2E7D32";
+
+        var totalTime = 8000;
+        var step = 100;
+        var elapsed = 0;
+
+        var speechBarInterval = setInterval(function () {
+            elapsed += step;
+            var pct = Math.max(0, 100 - (elapsed / totalTime) * 100);
+            progressBar.style.width = pct + "%";
+            if (elapsed >= totalTime) clearInterval(speechBarInterval);
+        }, step);
+
+        try {
+            qc.start();
+
+            qc._baseline = null;
+            var baselineData = await new Promise(function (resolve) {
+                qc._baselineCapture = {
+                    centroids: [],
+                    hfrs: [],
+                    endAt: performance.now() + totalTime,
+                    resolve: resolve
+                };
+            });
+
+            clearInterval(speechBarInterval);
+            progressContainer.style.display = "none";
+
+            var voicedFrames = (baselineData && baselineData.baseline_voiced_frames != null) ? baselineData.baseline_voiced_frames : 0;
+
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_baseline_centroid", (baselineData && baselineData.baseline_centroid_p90_hz != null) ? String(baselineData.baseline_centroid_p90_hz) : "");
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_baseline_hfr", (baselineData && baselineData.baseline_hfr != null) ? String(baselineData.baseline_hfr) : "");
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_baseline_voiced_frames", String(voicedFrames));
+
+            if (voicedFrames < 15) {
+                statusEl.innerHTML = 
+                    "<b style='color:#dc2626;'>❌ No speech detected during reading prompt.</b><br><br>" +
+                    "Please read the sentence aloud so we can calibrate your voice.";
+                retryBtn.style.display = "inline-block";
+                return;
+            }
+
+            statusEl.innerHTML = "Voice calibration complete.";
+            instructionsEl.innerHTML = 
+                "🎤 <b>Final Speech Check</b><br><br>" +
+                "Please speak naturally for 10 seconds (e.g., describe your day or surroundings).";
+            actionBtn.innerHTML = "Start 10s Recording";
+            actionBtn.style.backgroundColor = "#E65100";
+            actionBtn.style.display = "inline-block";
+
+        } catch (err) {
+            clearInterval(speechBarInterval);
+            progressContainer.style.display = "none";
+            statusEl.innerHTML = "Voice calibration failed.";
+            retryBtn.style.display = "inline-block";
+        }
+    };
+
+    // STEP 3: 10s SPEECH RECORDING & STRICT CRITERIA GATING
+    var runRecordingPhase = async function () {
+        instructionsEl.innerHTML = "🎤 <b>Please speak now...</b><br><br>Talk about your day or what you did today.";
+        statusEl.innerHTML = "Recording in progress (10 seconds)...";
+
+        progressContainer.style.display = "block";
+        progressBar.style.width = "100%";
+        progressBar.style.backgroundColor = "#E65100";
+
+        var totalTime = 10000;
+        var step = 100;
+        var elapsed = 0;
+
+        var recBarInterval = setInterval(function () {
+            elapsed += step;
+            var pct = Math.max(0, 100 - (elapsed / totalTime) * 100);
+            progressBar.style.width = pct + "%";
+            if (elapsed >= totalTime) clearInterval(recBarInterval);
+        }, step);
+
+        qc.start();
+        qc.startQuestion('env');
+        qc.markRecordingStart('env', { signal: 'recording' });
+
+        await new Promise(function (resolve) { setTimeout(resolve, totalTime); });
+
+        clearInterval(recBarInterval);
+        progressContainer.style.display = "none";
+
+        var rep = qc.finaliseQuestion('env') || {};
+
+        var devInfo = null;
+        try { devInfo = await qc.getDeviceInfo(); } catch(e) {}
+
+        // --- PACKAGE SESSION STATE FOR SUBSEQUENT QUESTION PAGES ---
+        var sessionPayload = "";
+        try {
+            if (qc && typeof qc.getSessionState === "function") {
+                var stateObj = qc.getSessionState();
+                sessionPayload = JSON.stringify(stateObj);
+                try {
+                    sessionStorage.setItem("glad_qc_session_v1", sessionPayload);
+                } catch (e) {}
+            }
+        } catch (e) {}
+
+        // Save Qualtrics Embedded Data
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_session_state", sessionPayload);
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_report_json", JSON.stringify(rep));
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_snr", rep.mean_snr_db != null ? String(rep.mean_snr_db) : "");
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_voiced_pct", rep.voiced_pct != null ? String(rep.voiced_pct) : "");
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_duration", rep.duration_sec != null ? String(rep.duration_sec) : "");
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_speech_sec", rep.speech_sec != null ? String(rep.speech_sec) : "");
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_clipped_pct", rep.clipped_pct != null ? String(rep.clipped_pct) : "");
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_engine_verdict", rep.verdict ? String(rep.verdict) : "");
+
+        if (devInfo) {
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_device_os", (devInfo.platform && devInfo.platform.os) ? String(devInfo.platform.os) : "");
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_device_browser", (devInfo.platform && devInfo.platform.browser) ? String(devInfo.platform.browser) : "");
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_mic_label", (devInfo.microphone && devInfo.microphone.label) ? String(devInfo.microphone.label) : "");
+        }
+
+        var minSpeech = (qc.opts && qc.opts.env && qc.opts.env.minSpeechSec) ? qc.opts.env.minSpeechSec : 1.0;
+        var snrWarn = (qc.opts && qc.opts.thresholds && qc.opts.thresholds.snrWarn) ? qc.opts.thresholds.snrWarn : 12.0;
+        var maxClipped = (qc.opts && qc.opts.env && qc.opts.env.maxClippedSpeechPct) ? qc.opts.env.maxClippedSpeechPct : 2.0;
+
+        var snr = (rep.mean_snr_db != null && !isNaN(rep.mean_snr_db)) ? Number(rep.mean_snr_db) : null;
+        var voiced = (rep.voiced_pct != null && !isNaN(rep.voiced_pct)) ? Number(rep.voiced_pct) : 0;
+        var speechSec = (rep.speech_sec != null && !isNaN(rep.speech_sec)) ? Number(rep.speech_sec) : 0;
+        var clipped = (rep.clipped_pct != null && !isNaN(rep.clipped_pct)) ? Number(rep.clipped_pct) : 0;
+        var duration = (rep.duration_sec != null && !isNaN(rep.duration_sec)) ? Number(rep.duration_sec) : 0;
+
+        var snrDisplay = (snr !== null) ? snr.toFixed(1) + " dB" : "N/A";
+        var voicedDisplay = voiced.toFixed(1) + "%";
+        var speechSecDisplay = speechSec.toFixed(1) + "s";
+        var durDisplay = duration.toFixed(1) + "s";
+        var noiseDisplay = (rep.noise_floor_dbfs != null && !isNaN(rep.noise_floor_dbfs)) ? Number(rep.noise_floor_dbfs).toFixed(1) + " dBFS" : "N/A";
+
+        var pass = true;
+        var failReasons = [];
+
+        // GATE 3: Kavan Criteria Enforcement
+        if (speechSec < minSpeech || voiced < 15.0) { 
+            pass = false; 
+            failReasons.push("No speech detected (spoke for " + speechSecDisplay + ", required ≥ " + minSpeech.toFixed(1) + "s)"); 
+        }
+        if (snr === null || snr < snrWarn) { 
+            pass = false; 
+            failReasons.push("SNR too low (" + snrDisplay + ", required ≥ " + snrWarn.toFixed(1) + " dB)"); 
+        }
+        if (clipped > maxClipped) {
+            pass = false;
+            failReasons.push("Microphone clipping (" + clipped.toFixed(1) + "%, allowed ≤ " + maxClipped.toFixed(1) + "%)");
+        }
+        if (duration < 5) { 
+            pass = false; 
+            failReasons.push("Recording was interrupted"); 
+        }
+
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_pass", pass ? "1" : "0");
+        Qualtrics.SurveyEngine.setEmbeddedData("qc_fail_reasons", JSON.stringify(failReasons));
+
+        if (pass) {
+            statusEl.innerHTML = 
+                "<b style='color:green; font-size:18px;'>✅ Environment Check Passed!</b><br><br>" +
+                "<div style='display:inline-block; text-align:left; background:#f8fafc; border:1px solid #cbd5e1; border-radius:6px; padding:10px 16px; font-size:14px; line-height:1.6; margin-bottom:12px;'>" +
+                "  <b>Summary Metrics:</b><br>" +
+                "  • <b>SNR:</b> " + snrDisplay + " (target ≥ " + snrWarn.toFixed(1) + " dB)<br>" +
+                "  • <b>Voiced Speech:</b> " + voicedDisplay + " (" + speechSecDisplay + ") (target ≥ " + minSpeech.toFixed(1) + "s)<br>" +
+                "  • <b>Noise Floor:</b> " + noiseDisplay + "<br>" +
+                "  • <b>Duration:</b> " + durDisplay + "" +
+                "</div><br>" +
+                "Thank you. You may now continue.";
+            revealNext();
+        } else if (attempt >= 2) {
+            Qualtrics.SurveyEngine.setEmbeddedData("qc_forced_pass", "1");
+            statusEl.innerHTML = 
+                "<b>Notice:</b> We could not detect clear speech after 2 attempts, but you may proceed.<br><br>" +
+                "<div style='display:inline-block; text-align:left; background:#f8fafc; border:1px solid #cbd5e1; border-radius:6px; padding:10px 16px; font-size:14px; line-height:1.6; margin-bottom:12px;'>" +
+                "  • <b>SNR:</b> " + snrDisplay + "<br>" +
+                "  • <b>Voiced Speech:</b> " + voicedDisplay + " (" + speechSecDisplay + ")<br>" +
+                "  • <b>Noise Floor:</b> " + noiseDisplay + "" +
+                "</div><br>" +
+                "Press Next to continue.";
+            revealNext();
+        } else {
+            statusEl.innerHTML = 
+                "<b style='color:#dc2626; font-size:16px;'>❌ Check Failed</b><br><br>" +
+                "<div style='display:inline-block; text-align:left; background:#fef2f2; border:1px solid #fecaca; border-radius:6px; padding:10px 16px; font-size:13px; line-height:1.5; margin-bottom:12px;'>" +
+                "  <b>Recorded Values:</b><br>" +
+                "  • <b>Voiced Speech:</b> " + voicedDisplay + " (" + speechSecDisplay + ")<br>" +
+                "  • <b>SNR:</b> " + snrDisplay + "<br>" +
+                "  • <b>Noise Floor:</b> " + noiseDisplay + "<br><br>" +
+                "  <b>Failure Reason:</b><br>" +
+                "  " + failReasons.join("<br>") +
+                "</div><br>" +
+                "Please speak clearly during the prompt and click <b>Retry</b> below.";
+            retryBtn.style.display = "inline-block";
+        }
+
+        if (qc) {
+            try { await qc.stop(); } catch(e) {}
+            qc = null;
+        }
+    };
+});
+/* ==================================================================
+ * END OF ESTEBAN'S CODE
+ * ================================================================== */
